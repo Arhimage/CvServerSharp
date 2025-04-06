@@ -1,0 +1,18 @@
+syntax = "proto3";
+
+option csharp_namespace = "RobotSlam";
+
+service RobotSLAM {
+    rpc ProcessFrame (FrameRequest) returns (FrameResponse);
+}
+
+message FrameRequest {
+    bytes image_data = 1;
+}
+
+message FrameResponse {
+    bytes slam_image = 1;
+    float dx = 2;
+    float dy = 3;
+    float angle = 4;
+}
