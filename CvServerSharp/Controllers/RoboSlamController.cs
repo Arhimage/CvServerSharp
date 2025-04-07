@@ -101,7 +101,7 @@ namespace RobotSlamServer
                 };
 
                 // Передача запроса в сервис для обработки
-                var result = _slamService.ProcessStereoFrame(stereoRequest);
+                var result = SlamProcessor.ProcessStereoFrame(stereoRequest);
 
                 // Возвращаем ответ с обработанными данными и изображениями
                 return Ok(result);
