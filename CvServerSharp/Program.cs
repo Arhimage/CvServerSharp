@@ -24,7 +24,7 @@ builder.Services.AddCors(options =>
     });
 });
 builder.Services.AddControllers();
-builder.Services.AddSingleton<SlamProcessor>();
+//builder.Services.AddSingleton<SlamProcessor>();
 
 var app = builder.Build();
 

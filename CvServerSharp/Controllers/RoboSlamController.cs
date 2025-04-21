@@ -11,12 +11,12 @@ namespace RobotSlamServer
     [Route("api/slam")]
     public class RobotSlamController : ControllerBase
     {
-        private readonly SlamProcessor _slamService;
+        //private readonly SlamProcessor _slamService;
         private readonly ILogger<RobotSlamController> _logger;
 
-        public RobotSlamController(SlamProcessor slamService, ILogger<RobotSlamController> logger)
+        public RobotSlamController(ILogger<RobotSlamController> logger)
         {
-            _slamService = slamService;
+            //_slamService = slamService;
             _logger = logger;
         }
 
@@ -101,7 +101,7 @@ namespace RobotSlamServer
                 };
 
                 // Передача запроса в сервис для обработки
-                var result = SlamProcessor.ProcessStereoFrame(stereoRequest);
+                var result = SlamProcessor.ProcessFrame(stereoRequest);
 
                 // Возвращаем ответ с обработанными данными и изображениями
                 return Ok(result);

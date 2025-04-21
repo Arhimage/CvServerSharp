@@ -56,359 +56,253 @@ namespace RobotSlamServer
         public double Height { get; set; }
     }
 
-    public class SlamProcessor
+    public static class SlamProcessor
     {
-        private static readonly int MIN_FRAMES_FOR_SLAM = 15;
-        private static readonly int MAP_SIZE = 800;
-        private static readonly int MAP_SCALE = 80;
-        private static readonly Random random = new Random();
+        private static List<PointF> _slamPoints = new List<PointF>();
+        private static List<PointF> _robotPath = new List<PointF>();
+        private static PointF _currentRobotPosition = new PointF(0, 0);
+        private static float _currentRobotAngleY = 0;
+        private static Random _random = new Random();
+        private const float Scale = 80f;
+        private static SIFT _siftDetector = new SIFT();
 
-        private static Mat slamMap;
-        private static List<VectorOfKeyPoint> allKeypoints = new List<VectorOfKeyPoint>();
-        private static List<Mat> allDescriptors = new List<Mat>();
-        private static List<Tuple<double, double, double>> trajectory = new List<Tuple<double, double, double>>();
-        private static int processedFramesCount = 0;
-        private static bool isInitialized = false;
-
-        private static void Initialize()
+        public static StereoFrameResponse ProcessFrame(StereoFrameRequest request)
         {
-            if (!isInitialized)
+            _currentRobotPosition = new PointF((float)request.RobotX, (float)request.RobotY);
+            _currentRobotAngleY = (float)request.RobotAngleY;
+
+            if (!_robotPath.Any(p => Math.Abs(p.X - _currentRobotPosition.X) < 0.1f &&
+                                   Math.Abs(p.Y - _currentRobotPosition.Y) < 0.1f))
             {
-                slamMap = new Mat(MAP_SIZE, MAP_SIZE, DepthType.Cv8U, 3);
-                slamMap.SetTo(new MCvScalar(255, 255, 255));
-                isInitialized = true;
+                _robotPath.Add(new PointF(_currentRobotPosition.X, _currentRobotPosition.Y));
+            }
+
+            Mat leftImage = new Mat();
+            CvInvoke.Imdecode(request.LeftImageData, ImreadModes.Color, leftImage);
+            Mat rightImage = new Mat();
+            CvInvoke.Imdecode(request.RightImageData, ImreadModes.Color, rightImage);
+
+            Mat processedLeft = ProcessImage(leftImage);
+            Mat processedRight = ProcessImage(rightImage);
+
+            UpdateSlamMap();
+
+            return new StereoFrameResponse
+            {
+                ProcessedLeftImage = processedLeft.ToImage<Bgr, byte>().ToJpegData(),
+                ProcessedRightImage = processedRight.ToImage<Bgr, byte>().ToJpegData(),
+                SlamMapImage = GenerateSlamMapImage(),
+                NextX = GetNextX(),
+                NextY = GetNextY(),
+                NextAngleY = _currentRobotAngleY + (float)(_random.NextDouble() * 0.2 - 0.1),
+                IsSlammingComplete = false
+            };
+        }
+
+        private static Mat ProcessImage(Mat image)
+        {
+            if (image.IsEmpty)
+                return new Mat();
+
+            Mat grayImage = new Mat();
+            CvInvoke.CvtColor(image, grayImage, ColorConversion.Bgr2Gray);
+            CvInvoke.EqualizeHist(grayImage, grayImage);
+
+            VectorOfKeyPoint keyPoints = new VectorOfKeyPoint();
+            using (Mat descriptors = new Mat())
+            {
+                _siftDetector.DetectAndCompute(grayImage, null, keyPoints, descriptors, false);
+
+                Mat result = image.Clone();
+                if (keyPoints.Size > 0)
+                {
+                    Features2DToolbox.DrawKeypoints(
+                        image,
+                        keyPoints,
+                        result,
+                        new Bgr(Color.Red),
+                        Features2DToolbox.KeypointDrawType.Default);
+
+                    UpdateSlamPoints(keyPoints);
+                }
+                return result;
             }
         }
 
-        public static StereoFrameResponse ProcessStereoFrame(StereoFrameRequest request)
+        private static void UpdateSlamPoints(VectorOfKeyPoint keyPoints)
         {
-            Initialize();
-
-            // Обновление позиции робота в траектории
-            trajectory.Add(new Tuple<double, double, double>(request.RobotX, request.RobotY, request.RobotAngleY));
-
-            // Преобразование входных изображений
-            Mat leftImage = ConvertByteArrayToMat(request.LeftImageData);
-            Mat rightImage = ConvertByteArrayToMat(request.RightImageData);
-
-            // Предобработка изображений
-            Mat leftGray = PreprocessImage(leftImage);
-            Mat rightGray = PreprocessImage(rightImage);
-
-            // Извлечение ключевых точек и дескрипторов
-            var leftResult = ExtractFeatures(leftGray);
-            var rightResult = ExtractFeatures(rightGray);
-
-            VectorOfKeyPoint leftKeypoints = leftResult.Item1;
-            Mat leftDescriptors = leftResult.Item2;
-
-            VectorOfKeyPoint rightKeypoints = rightResult.Item1;
-            Mat rightDescriptors = rightResult.Item2;
-
-            // Сохранение ключевых точек и дескрипторов
-            allKeypoints.Add(leftKeypoints);
-            allDescriptors.Add(leftDescriptors);
-
-            // Визуализация ключевых точек
-            Mat leftVisual = leftImage.Clone();
-            Mat rightVisual = rightImage.Clone();
-
-            Features2DToolbox.DrawKeypoints(leftImage, leftKeypoints, leftVisual, new Bgr(0, 0, 255), Features2DToolbox.KeypointDrawType.DrawRichKeypoints);
-            Features2DToolbox.DrawKeypoints(rightImage, rightKeypoints, rightVisual, new Bgr(0, 0, 255), Features2DToolbox.KeypointDrawType.DrawRichKeypoints);
-
-            // Обновление SLAM карты
-            UpdateSlamMap();
-
-            // Расчет следующей позиции для робота
-            var (nextX, nextY, nextAngleY) = CalculateNextPosition(request.RobotX, request.RobotY, request.RobotAngleY, request.CartographerSpeed);
-
-            // Проверка завершения SLAM
-            processedFramesCount++;
-            bool isComplete = IsSlammingComplete();
-
-            // Подготовка ответа
-            var response = new StereoFrameResponse
+            MKeyPoint[] points = keyPoints.ToArray();
+            foreach (var kp in points)
             {
-                ProcessedLeftImage = ConvertMatToByteArray(leftVisual),
-                ProcessedRightImage = ConvertMatToByteArray(rightVisual),
-                SlamMapImage = ConvertMatToByteArray(slamMap),
-                NextX = (float)nextX,
-                NextY = (float)nextY,
-                NextAngleY = (float)nextAngleY,
-                NextAngleX = 0,
-                NextAngleZ = 0,
-                IsSlammingComplete = isComplete
-            };
-
-            return response;
+                PointF point = new PointF(kp.Point.X, kp.Point.Y);
+                if (!_slamPoints.Any(p => Math.Abs(p.X - point.X) < 1.0f &&
+                                        Math.Abs(p.Y - point.Y) < 1.0f))
+                {
+                    _slamPoints.Add(point);
+                }
+            }
+            FilterVerticalPoints();
+            RepelPointsFromRobot();
         }
 
-        private static Mat PreprocessImage(Mat image)
+        private static void FilterVerticalPoints()
         {
-            Mat gray = new Mat();
-            CvInvoke.CvtColor(image, gray, ColorConversion.Bgr2Gray);
-
-            // Гистограммная нормализация
-            Mat normalized = new Mat();
-            CvInvoke.EqualizeHist(gray, normalized);
-
-            return normalized;
+            _slamPoints = _slamPoints
+                .Where(p => Math.Abs(p.X - _currentRobotPosition.X) < 50)
+                .ToList();
         }
 
-        private static Tuple<VectorOfKeyPoint, Mat> ExtractFeatures(Mat image)
+        private static void RepelPointsFromRobot()
         {
-            var detector = new SIFT();
-            var keypoints = new VectorOfKeyPoint();
-            Mat descriptors = new Mat();
+            float repelRadius = 30f;
+            var newPoints = new List<PointF>();
 
-            detector.DetectAndCompute(image, null, keypoints, descriptors, false);
+            foreach (var point in _slamPoints)
+            {
+                float dx = point.X - _currentRobotPosition.X;
+                float dy = point.Y - _currentRobotPosition.Y;
+                float distance = (float)Math.Sqrt(dx * dx + dy * dy);
 
-            return new Tuple<VectorOfKeyPoint, Mat>(keypoints, descriptors);
+                if (distance < repelRadius && distance > 0)
+                {
+                    float repelForce = (repelRadius - distance) / distance;
+                    newPoints.Add(new PointF(
+                        point.X + dx * repelForce,
+                        point.Y + dy * repelForce));
+                }
+                else
+                {
+                    newPoints.Add(point);
+                }
+            }
+            _slamPoints = newPoints;
         }
 
         private static void UpdateSlamMap()
         {
-            // Очистка карты
-            slamMap.SetTo(new MCvScalar(255, 255, 255));
+            if (_slamPoints.Count == 0) return;
 
-            // Рисование сетки
-            DrawGrid();
+            float minX = _slamPoints.Min(p => p.X);
+            float maxX = _slamPoints.Max(p => p.X);
+            float minY = _slamPoints.Min(p => p.Y);
+            float maxY = _slamPoints.Max(p => p.Y);
 
-            // Рисование осей координат
-            DrawAxes();
+            float centerX = (minX + maxX) / 2;
+            float centerY = (minY + maxY) / 2;
 
-            // Рисование траектории
-            DrawTrajectory();
-
-            // Рисование ключевых точек
-            DrawKeypoints();
-        }
-
-        private static void DrawGrid()
-        {
-            int cellSize = MAP_SCALE;
-            for (int i = 0; i < MAP_SIZE; i += cellSize)
+            for (int i = 0; i < _slamPoints.Count; i++)
             {
-                CvInvoke.Line(slamMap,
-                    new System.Drawing.Point(i, 0),
-                    new System.Drawing.Point(i, MAP_SIZE),
-                    new MCvScalar(230, 230, 230), 1);
+                _slamPoints[i] = new PointF(
+                    _slamPoints[i].X - centerX,
+                    _slamPoints[i].Y - centerY);
+            }
 
-                CvInvoke.Line(slamMap,
-                    new System.Drawing.Point(0, i),
-                    new System.Drawing.Point(MAP_SIZE, i),
-                    new MCvScalar(230, 230, 230), 1);
+            _currentRobotPosition = new PointF(
+                _currentRobotPosition.X - centerX,
+                _currentRobotPosition.Y - centerY);
+
+            for (int i = 0; i < _robotPath.Count; i++)
+            {
+                _robotPath[i] = new PointF(
+                    _robotPath[i].X - centerX,
+                    _robotPath[i].Y - centerY);
             }
         }
 
-        private static void DrawAxes()
+        private static byte[] GenerateSlamMapImage()
         {
-            // Центр карты
-            int centerX = MAP_SIZE / 2;
-            int centerY = MAP_SIZE / 2;
+            if (_slamPoints.Count == 0)
+                return new byte[0];
 
-            // Ось X (красная)
-            CvInvoke.Line(slamMap,
-                new System.Drawing.Point(centerX, centerY),
-                new System.Drawing.Point(centerX + MAP_SCALE, centerY),
-                new MCvScalar(0, 0, 255), 2);
-
-            // Ось Y (зеленая)
-            CvInvoke.Line(slamMap,
-                new System.Drawing.Point(centerX, centerY),
-                new System.Drawing.Point(centerX, centerY - MAP_SCALE),
-                new MCvScalar(0, 255, 0), 2);
-        }
-
-        private static void DrawTrajectory()
-        {
-            if (trajectory.Count < 2) return;
-
-            int centerX = MAP_SIZE / 2;
-            int centerY = MAP_SIZE / 2;
-
-            for (int i = 1; i < trajectory.Count; i++)
+            int width = 800;
+            int height = 600;
+            using (Mat map = new Mat(height, width, DepthType.Cv8U, 3))
             {
-                var prev = trajectory[i - 1];
-                var curr = trajectory[i];
+                map.SetTo(new MCvScalar(255, 255, 255));
 
-                int prevX = centerX + (int)(prev.Item1 * MAP_SCALE);
-                int prevY = centerY - (int)(prev.Item2 * MAP_SCALE);
+                CvInvoke.Line(map,
+                    new Point(width / 2, 0),
+                    new Point(width / 2, height),
+                    new MCvScalar(0, 0, 0), 1);
+                CvInvoke.Line(map,
+                    new Point(0, height / 2),
+                    new Point(width, height / 2),
+                    new MCvScalar(0, 0, 0), 1);
 
-                int currX = centerX + (int)(curr.Item1 * MAP_SCALE);
-                int currY = centerY - (int)(curr.Item2 * MAP_SCALE);
-
-                // Проверка границ карты
-                if (IsInBounds(prevX, prevY) && IsInBounds(currX, currY))
+                foreach (var point in _slamPoints)
                 {
-                    // Рисуем линию траектории (синяя)
-                    CvInvoke.Line(slamMap,
-                        new System.Drawing.Point(prevX, prevY),
-                        new System.Drawing.Point(currX, currY),
-                        new MCvScalar(255, 0, 0), 2);
-
-                    // Рисуем направление (красная стрелка)
-                    double angle = curr.Item3;
-                    int arrowLength = 15;
-                    int arrowX = (int)(currX + arrowLength * Math.Sin(angle));
-                    int arrowY = (int)(currY - arrowLength * Math.Cos(angle));
-
-                    if (IsInBounds(arrowX, arrowY))
+                    int x = (int)(point.X * Scale) + width / 2;
+                    int y = (int)(point.Y * Scale) + height / 2;
+                    if (x >= 0 && x < width && y >= 0 && y < height)
                     {
-                        CvInvoke.ArrowedLine(slamMap,
-                            new System.Drawing.Point(currX, currY),
-                            new System.Drawing.Point(arrowX, arrowY),
-                            new MCvScalar(0, 0, 255), 2);
+                        CvInvoke.Circle(map,
+                            new Point(x, y),
+                            3,
+                            new MCvScalar(0, 255, 0),
+                            -1);
                     }
                 }
-            }
-        }
 
-        private static void DrawKeypoints()
-        {
-            int centerX = MAP_SIZE / 2;
-            int centerY = MAP_SIZE / 2;
-
-            for (int i = 0; i < allKeypoints.Count; i++)
-            {
-                if (i >= trajectory.Count) continue;
-
-                var currPos = trajectory[i];
-                var keypoints = allKeypoints[i];
-
-                int robotX = centerX + (int)(currPos.Item1 * MAP_SCALE);
-                int robotY = centerY - (int)(currPos.Item2 * MAP_SCALE);
-
-                // Получаем массив ключевых точек из VectorOfKeyPoint
-                MKeyPoint[] kpArray = keypoints.ToArray();
-
-                foreach (var kp in kpArray)
+                for (int i = 1; i < _robotPath.Count; i++)
                 {
-                    // Используем размер ключевой точки для имитации глубины
-                    int depth = (int)(5 + kp.Size);
+                    Point prev = new Point(
+                        (int)(_robotPath[i - 1].X * Scale) + width / 2,
+                        (int)(_robotPath[i - 1].Y * Scale) + height / 2);
+                    Point current = new Point(
+                        (int)(_robotPath[i].X * Scale) + width / 2,
+                        (int)(_robotPath[i].Y * Scale) + height / 2);
 
-                    // Случайный цвет для ключевой точки в зависимости от глубины
-                    byte r = (byte)(50 + (depth * 10) % 150);
-                    byte g = (byte)(50 + (depth * 15) % 150);
-                    byte b = (byte)(50 + (depth * 20) % 150);
-
-                    // Относительные координаты точки (с учетом угла)
-                    double angle = currPos.Item3;
-                    double relX = Math.Cos(angle) * kp.Point.X - Math.Sin(angle) * kp.Point.Y;
-                    double relY = Math.Sin(angle) * kp.Point.X + Math.Cos(angle) * kp.Point.Y;
-
-                    int pointX = robotX + (int)(relX / 10);
-                    int pointY = robotY - (int)(relY / 10);
-
-                    if (IsInBounds(pointX, pointY))
+                    if (prev.X >= 0 && prev.X < width && prev.Y >= 0 && prev.Y < height &&
+                        current.X >= 0 && current.X < width && current.Y >= 0 && current.Y < height)
                     {
-                        CvInvoke.Circle(slamMap,
-                            new System.Drawing.Point(pointX, pointY),
-                            2, new MCvScalar(b, g, r), -1);
+                        CvInvoke.Line(map, prev, current, new MCvScalar(255, 0, 0), 2);
                     }
                 }
-            }
-        }
 
-        private static bool IsInBounds(int x, int y)
-        {
-            return x >= 0 && x < MAP_SIZE && y >= 0 && y < MAP_SIZE;
-        }
+                Point robotPos = new Point(
+                    (int)(_currentRobotPosition.X * Scale) + width / 2,
+                    (int)(_currentRobotPosition.Y * Scale) + height / 2);
 
-        private static Tuple<double, double, double> CalculateNextPosition(double currentX, double currentY, double currentAngle, double speed)
-        {
-            // Максимальное смещение для движения
-            double maxMovement = speed * 0.2;
-            double minMovement = speed * 0.05;
-
-            // Случайное смещение вперед
-            double distance = minMovement + random.NextDouble() * (maxMovement - minMovement);
-
-            // Случайное изменение угла
-            double angleChange = (random.NextDouble() - 0.5) * Math.PI / 4;
-            double newAngle = currentAngle + angleChange;
-
-            // Сохраняем угол в диапазоне [0, 2π]
-            newAngle = (newAngle + 2 * Math.PI) % (2 * Math.PI);
-
-            // Расчет новых координат с учетом угла
-            double newX = currentX + distance * Math.Sin(newAngle);
-            double newY = currentY + distance * Math.Cos(newAngle);
-
-            // Проверка на выход за границы сцены (условно ±5 единиц)
-            const double SCENE_BOUNDARY = 5.0;
-
-            if (newX > SCENE_BOUNDARY) { newX = SCENE_BOUNDARY; newAngle = -newAngle; }
-            if (newX < -SCENE_BOUNDARY) { newX = -SCENE_BOUNDARY; newAngle = -newAngle; }
-            if (newY > SCENE_BOUNDARY) { newY = SCENE_BOUNDARY; newAngle = Math.PI - newAngle; }
-            if (newY < -SCENE_BOUNDARY) { newY = -SCENE_BOUNDARY; newAngle = Math.PI - newAngle; }
-
-            return new Tuple<double, double, double>(newX, newY, newAngle);
-        }
-
-        private static bool IsSlammingComplete()
-        {
-            if (processedFramesCount < MIN_FRAMES_FOR_SLAM)
-                return false;
-
-            return HasGoodCoverage();
-        }
-
-        private static bool HasGoodCoverage()
-        {
-            // Минимальная площадь покрытия: 10x10 условных единиц
-            if (trajectory.Count < 10) return false;
-
-            double minX = trajectory.Min(p => p.Item1);
-            double maxX = trajectory.Max(p => p.Item1);
-            double minY = trajectory.Min(p => p.Item2);
-            double maxY = trajectory.Max(p => p.Item2);
-
-            double width = maxX - minX;
-            double height = maxY - minY;
-
-            return (width >= 1.0 && height >= 1.0);
-        }
-
-        private static Mat ConvertByteArrayToMat(byte[] imageData)
-        {
-            if (imageData == null || imageData.Length == 0)
-            {
-                throw new ArgumentException("Image data cannot be null or empty", nameof(imageData));
-            }
-
-            Mat result = new Mat();
-
-            try
-            {
-                CvInvoke.Imdecode(imageData, ImreadModes.Color, result);
-
-                if (result.IsEmpty)
+                if (robotPos.X >= 0 && robotPos.X < width &&
+                    robotPos.Y >= 0 && robotPos.Y < height)
                 {
-                    throw new ArgumentException("Failed to decode image - possibly corrupted or unsupported format");
+                    CvInvoke.Circle(map, robotPos, 5, new MCvScalar(0, 0, 255), -1);
+                    Point arrowEnd = new Point(
+                        robotPos.X + (int)(20 * Math.Cos(_currentRobotAngleY)),
+                        robotPos.Y + (int)(20 * Math.Sin(_currentRobotAngleY)));
+                    CvInvoke.ArrowedLine(map, robotPos, arrowEnd, new MCvScalar(0, 0, 255), 2);
                 }
 
-                return result;
-            }
-            catch (Exception ex)
-            {
-                result?.Dispose();
-                throw new ArgumentException("Failed to convert byte array to Mat", nameof(imageData), ex);
+                return map.ToImage<Bgr, byte>().ToJpegData();
             }
         }
 
-        private static byte[] ConvertMatToByteArray(Mat image)
+        private static float GetNextX()
         {
-            if (image == null || image.IsEmpty)
-            {
-                throw new ArgumentException("Image cannot be null or empty", nameof(image));
-            }
+            float moveDistance = 0.5f;
+            float nextX = _currentRobotPosition.X + moveDistance * (float)Math.Cos(_currentRobotAngleY);
 
-            using (VectorOfByte vb = new VectorOfByte())
+            if (_slamPoints.Any(p =>
+                Math.Abs(p.X - nextX) < 10 &&
+                Math.Abs(p.Y - _currentRobotPosition.Y) < 10))
             {
-                CvInvoke.Imencode(".png", image, vb);
-                return vb.ToArray();
+                return nextX;
             }
+            return _currentRobotPosition.X;
+        }
+
+        private static float GetNextY()
+        {
+            float moveDistance = 0.5f;
+            float nextY = _currentRobotPosition.Y + moveDistance * (float)Math.Sin(_currentRobotAngleY);
+
+            if (_slamPoints.Any(p =>
+                Math.Abs(p.X - _currentRobotPosition.X) < 10 &&
+                Math.Abs(p.Y - nextY) < 10))
+            {
+                return nextY;
+            }
+            return _currentRobotPosition.Y;
         }
     }
 }
