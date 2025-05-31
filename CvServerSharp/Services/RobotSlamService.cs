@@ -3,10 +3,9 @@ using Emgu.CV.CvEnum;
 using Emgu.CV.Features2D;
 using Emgu.CV.Structure;
 using Emgu.CV.Util;
-using System.Diagnostics;
 using System.Drawing;
-using System.Runtime.InteropServices;
-using System.Xml.Linq;
+using System.Collections.Concurrent;
+using System.Linq;
 
 namespace RobotSlamServer
 {
@@ -14,7 +13,6 @@ namespace RobotSlamServer
     {
         public double RobotX { get; set; }
         public double RobotY { get; set; }
-        // Углы поворота из Unity
         public double RobotAngleX { get; set; }
         public double RobotAngleY { get; set; }
         public double RobotAngleZ { get; set; }
@@ -30,76 +28,73 @@ namespace RobotSlamServer
         public byte[] ProcessedLeftImage { get; set; }
         public byte[] ProcessedRightImage { get; set; }
         public byte[] SlamMapImage { get; set; }
-        public float NextX { get; set; }
-        public float NextY { get; set; }
-        public float NextAngleX { get; set; }
-        public float NextAngleY { get; set; }
-        public float NextAngleZ { get; set; }
-        public bool IsSlammingComplete { get; set; }
     }
 
-    // Обновленный класс CameraInfo с дополнительными данными позиции камеры.
     public class CameraInfo
     {
-        // Фокусное расстояние камеры
         public double FocalLength { get; set; }
-
-        // Координаты главной точки на матрице камеры
         public double PrincipalPointX { get; set; }
         public double PrincipalPointY { get; set; }
-
-        // Смещение камеры относительно центра родительского элемента по оси X и Z.
         public double OffsetX { get; set; }
         public double OffsetZ { get; set; }
-
-        // Высота камеры относительно пола (ось Y)
         public double Height { get; set; }
     }
 
     public static class SlamProcessor
     {
-        private static List<PointF> _slamPoints = new List<PointF>();
-        private static List<PointF> _robotPath = new List<PointF>();
+        private static ConcurrentBag<PointF> _slamPoints = new ConcurrentBag<PointF>();
+        private static readonly ConcurrentBag<PointF> _robotPath = new ConcurrentBag<PointF>();
         private static PointF _currentRobotPosition = new PointF(0, 0);
         private static float _currentRobotAngleY = 0;
-        private static Random _random = new Random();
-        private const float Scale = 80f;
-        private static SIFT _siftDetector = new SIFT();
+        private static readonly object _positionLock = new object();
+        private static readonly object _slamPointsLock = new object();
+        private static readonly object _robotPathLock = new object();
+        private static readonly SIFT _siftDetector = new SIFT();
+        private static readonly float _maxDistanceFromPath = 10f;
+        private static readonly float _minDistanceBetweenPoints = 0.5f;
 
         public static StereoFrameResponse ProcessFrame(StereoFrameRequest request)
         {
-            _currentRobotPosition = new PointF((float)request.RobotX, (float)request.RobotY);
-            _currentRobotAngleY = (float)request.RobotAngleY;
+            PointF currentPosition = new PointF((float)request.RobotX, (float)request.RobotY);
+            float currentAngleY = (float)request.RobotAngleY;
 
-            if (!_robotPath.Any(p => Math.Abs(p.X - _currentRobotPosition.X) < 0.1f &&
-                                   Math.Abs(p.Y - _currentRobotPosition.Y) < 0.1f))
+            lock (_positionLock)
             {
-                _robotPath.Add(new PointF(_currentRobotPosition.X, _currentRobotPosition.Y));
+                _currentRobotPosition = currentPosition;
+                _currentRobotAngleY = currentAngleY;
             }
+
+            UpdateRobotPath(currentPosition);
 
             Mat leftImage = new Mat();
             CvInvoke.Imdecode(request.LeftImageData, ImreadModes.Color, leftImage);
             Mat rightImage = new Mat();
             CvInvoke.Imdecode(request.RightImageData, ImreadModes.Color, rightImage);
 
-            Mat processedLeft = ProcessImage(leftImage);
-            Mat processedRight = ProcessImage(rightImage);
-
-            UpdateSlamMap();
+            Mat processedLeft = ProcessImage(leftImage, currentPosition);
+            Mat processedRight = ProcessImage(rightImage, currentPosition);
 
             return new StereoFrameResponse
             {
                 ProcessedLeftImage = processedLeft.ToImage<Bgr, byte>().ToJpegData(),
                 ProcessedRightImage = processedRight.ToImage<Bgr, byte>().ToJpegData(),
                 SlamMapImage = GenerateSlamMapImage(),
-                NextX = GetNextX(),
-                NextY = GetNextY(),
-                NextAngleY = _currentRobotAngleY + (float)(_random.NextDouble() * 0.2 - 0.1),
-                IsSlammingComplete = false
             };
         }
 
-        private static Mat ProcessImage(Mat image)
+        private static void UpdateRobotPath(PointF currentPosition)
+        {
+            lock (_robotPathLock)
+            {
+                if (!_robotPath.Any() ||
+                    Distance(_robotPath.Last(), currentPosition) > _minDistanceBetweenPoints)
+                {
+                    _robotPath.Add(currentPosition);
+                }
+            }
+        }
+
+        private static Mat ProcessImage(Mat image, PointF currentPosition)
         {
             if (image.IsEmpty)
                 return new Mat();
@@ -123,117 +118,164 @@ namespace RobotSlamServer
                         new Bgr(Color.Red),
                         Features2DToolbox.KeypointDrawType.Default);
 
-                    UpdateSlamPoints(keyPoints);
+                    UpdateSlamPoints(keyPoints, currentPosition);
                 }
                 return result;
             }
         }
 
-        private static void UpdateSlamPoints(VectorOfKeyPoint keyPoints)
+        private static void UpdateSlamPoints(VectorOfKeyPoint keyPoints, PointF currentPosition)
         {
             MKeyPoint[] points = keyPoints.ToArray();
-            foreach (var kp in points)
-            {
-                PointF point = new PointF(kp.Point.X, kp.Point.Y);
-                if (!_slamPoints.Any(p => Math.Abs(p.X - point.X) < 1.0f &&
-                                        Math.Abs(p.Y - point.Y) < 1.0f))
-                {
-                    _slamPoints.Add(point);
-                }
-            }
-            FilterVerticalPoints();
-            RepelPointsFromRobot();
-        }
-
-        private static void FilterVerticalPoints()
-        {
-            _slamPoints = _slamPoints
-                .Where(p => Math.Abs(p.X - _currentRobotPosition.X) < 50)
-                .ToList();
-        }
-
-        private static void RepelPointsFromRobot()
-        {
-            float repelRadius = 30f;
             var newPoints = new List<PointF>();
 
-            foreach (var point in _slamPoints)
+            foreach (var kp in points)
             {
-                float dx = point.X - _currentRobotPosition.X;
-                float dy = point.Y - _currentRobotPosition.Y;
-                float distance = (float)Math.Sqrt(dx * dx + dy * dy);
+                PointF point = new PointF(currentPosition.X + kp.Point.X, currentPosition.Y + kp.Point.Y);
 
-                if (distance < repelRadius && distance > 0)
-                {
-                    float repelForce = (repelRadius - distance) / distance;
-                    newPoints.Add(new PointF(
-                        point.X + dx * repelForce,
-                        point.Y + dy * repelForce));
-                }
-                else
+                if (IsPointValid(point, currentPosition))
                 {
                     newPoints.Add(point);
                 }
             }
-            _slamPoints = newPoints;
+
+            if (newPoints.Count > 0)
+            {
+                lock (_slamPointsLock)
+                {
+                    foreach (var point in newPoints)
+                    {
+                        _slamPoints.Add(point);
+                    }
+                    RemoveDistantPoints();
+                }
+            }
         }
 
-        private static void UpdateSlamMap()
+        private static bool IsPointValid(PointF point, PointF currentPosition)
         {
-            if (_slamPoints.Count == 0) return;
+            float distanceToRobot = Distance(point, currentPosition);
 
-            float minX = _slamPoints.Min(p => p.X);
-            float maxX = _slamPoints.Max(p => p.X);
-            float minY = _slamPoints.Min(p => p.Y);
-            float maxY = _slamPoints.Max(p => p.Y);
+            if (distanceToRobot > _maxDistanceFromPath)
+                return false;
 
-            float centerX = (minX + maxX) / 2;
-            float centerY = (minY + maxY) / 2;
-
-            for (int i = 0; i < _slamPoints.Count; i++)
+            lock (_slamPointsLock)
             {
-                _slamPoints[i] = new PointF(
-                    _slamPoints[i].X - centerX,
-                    _slamPoints[i].Y - centerY);
+                foreach (var p in _slamPoints)
+                {
+                    if (Distance(p, point) < _minDistanceBetweenPoints)
+                    {
+                        return false;
+                    }
+                }
             }
 
-            _currentRobotPosition = new PointF(
-                _currentRobotPosition.X - centerX,
-                _currentRobotPosition.Y - centerY);
-
-            for (int i = 0; i < _robotPath.Count; i++)
+            lock (_robotPathLock)
             {
-                _robotPath[i] = new PointF(
-                    _robotPath[i].X - centerX,
-                    _robotPath[i].Y - centerY);
+                foreach (var pathPoint in _robotPath)
+                {
+                    if (Distance(point, pathPoint) < _minDistanceBetweenPoints)
+                    {
+                        return true;
+                    }
+                }
             }
+
+            return false;
+        }
+
+        private static void RemoveDistantPoints()
+        {
+            lock (_slamPointsLock)
+                lock (_robotPathLock)
+                {
+                    var validPoints = new ConcurrentBag<PointF>();
+                    foreach (var point in _slamPoints)
+                    {
+                        bool isNearPath = false;
+                        foreach (var pathPoint in _robotPath)
+                        {
+                            if (Distance(point, pathPoint) <= _maxDistanceFromPath)
+                            {
+                                isNearPath = true;
+                                break;
+                            }
+                        }
+
+                        if (isNearPath)
+                        {
+                            validPoints.Add(point);
+                        }
+                    }
+                    _slamPoints = validPoints;
+                }
+        }
+
+        private static float Distance(PointF a, PointF b)
+        {
+            float dx = a.X - b.X;
+            float dy = a.Y - b.Y;
+            return (float)Math.Sqrt(dx * dx + dy * dy);
         }
 
         private static byte[] GenerateSlamMapImage()
         {
-            if (_slamPoints.Count == 0)
+            List<PointF> slamPointsCopy;
+            List<PointF> robotPathCopy;
+            PointF robotPositionCopy;
+            float robotAngleYCopy;
+
+            lock (_slamPointsLock)
+            {
+                slamPointsCopy = _slamPoints.ToList();
+            }
+
+            lock (_robotPathLock)
+            {
+                robotPathCopy = _robotPath.ToList();
+            }
+
+            lock (_positionLock)
+            {
+                robotPositionCopy = _currentRobotPosition;
+                robotAngleYCopy = _currentRobotAngleY;
+            }
+
+            if (slamPointsCopy.Count == 0 && robotPathCopy.Count == 0)
                 return new byte[0];
 
-            int width = 800;
-            int height = 600;
-            using (Mat map = new Mat(height, width, DepthType.Cv8U, 3))
+            float minX = float.MaxValue, maxX = float.MinValue;
+            float minY = float.MaxValue, maxY = float.MinValue;
+
+            foreach (var point in slamPointsCopy.Concat(robotPathCopy))
+            {
+                minX = Math.Min(minX, point.X);
+                maxX = Math.Max(maxX, point.X);
+                minY = Math.Min(minY, point.Y);
+                maxY = Math.Max(maxY, point.Y);
+            }
+
+            minX = Math.Min(minX, robotPositionCopy.X);
+            maxX = Math.Max(maxX, robotPositionCopy.X);
+            minY = Math.Min(minY, robotPositionCopy.Y);
+            maxY = Math.Max(maxY, robotPositionCopy.Y);
+
+            float widthRange = maxX - minX;
+            float heightRange = maxY - minY;
+            float margin = 2f;
+            float scale = Math.Min(780f / (widthRange + margin), 580f / (heightRange + margin));
+
+            int imageWidth = 800;
+            int imageHeight = 600;
+            using (Mat map = new Mat(imageHeight, imageWidth, DepthType.Cv8U, 3))
             {
                 map.SetTo(new MCvScalar(255, 255, 255));
 
-                CvInvoke.Line(map,
-                    new Point(width / 2, 0),
-                    new Point(width / 2, height),
-                    new MCvScalar(0, 0, 0), 1);
-                CvInvoke.Line(map,
-                    new Point(0, height / 2),
-                    new Point(width, height / 2),
-                    new MCvScalar(0, 0, 0), 1);
-
-                foreach (var point in _slamPoints)
+                foreach (var point in slamPointsCopy)
                 {
-                    int x = (int)(point.X * Scale) + width / 2;
-                    int y = (int)(point.Y * Scale) + height / 2;
-                    if (x >= 0 && x < width && y >= 0 && y < height)
+                    int x = (int)((point.X - minX + margin / 2) * scale) + 10;
+                    int y = (int)((point.Y - minY + margin / 2) * scale) + 10;
+                    if (x >= 0 && x < imageWidth && y >= 0 && y < imageHeight)
                     {
                         CvInvoke.Circle(map,
                             new Point(x, y),
@@ -243,66 +285,38 @@ namespace RobotSlamServer
                     }
                 }
 
-                for (int i = 1; i < _robotPath.Count; i++)
+                for (int i = 1; i < robotPathCopy.Count; i++)
                 {
                     Point prev = new Point(
-                        (int)(_robotPath[i - 1].X * Scale) + width / 2,
-                        (int)(_robotPath[i - 1].Y * Scale) + height / 2);
+                        (int)((robotPathCopy[i - 1].X - minX + margin / 2) * scale) + 10,
+                        (int)((robotPathCopy[i - 1].Y - minY + margin / 2) * scale) + 10);
                     Point current = new Point(
-                        (int)(_robotPath[i].X * Scale) + width / 2,
-                        (int)(_robotPath[i].Y * Scale) + height / 2);
+                        (int)((robotPathCopy[i].X - minX + margin / 2) * scale) + 10,
+                        (int)((robotPathCopy[i].Y - minY + margin / 2) * scale) + 10);
 
-                    if (prev.X >= 0 && prev.X < width && prev.Y >= 0 && prev.Y < height &&
-                        current.X >= 0 && current.X < width && current.Y >= 0 && current.Y < height)
+                    if (prev.X >= 0 && prev.X < imageWidth && prev.Y >= 0 && prev.Y < imageHeight &&
+                        current.X >= 0 && current.X < imageWidth && current.Y >= 0 && current.Y < imageHeight)
                     {
                         CvInvoke.Line(map, prev, current, new MCvScalar(255, 0, 0), 2);
                     }
                 }
 
                 Point robotPos = new Point(
-                    (int)(_currentRobotPosition.X * Scale) + width / 2,
-                    (int)(_currentRobotPosition.Y * Scale) + height / 2);
+                    (int)((robotPositionCopy.X - minX + margin / 2) * scale) + 10,
+                    (int)((robotPositionCopy.Y - minY + margin / 2) * scale) + 10);
 
-                if (robotPos.X >= 0 && robotPos.X < width &&
-                    robotPos.Y >= 0 && robotPos.Y < height)
+                if (robotPos.X >= 0 && robotPos.X < imageWidth &&
+                    robotPos.Y >= 0 && robotPos.Y < imageHeight)
                 {
                     CvInvoke.Circle(map, robotPos, 5, new MCvScalar(0, 0, 255), -1);
                     Point arrowEnd = new Point(
-                        robotPos.X + (int)(20 * Math.Cos(_currentRobotAngleY)),
-                        robotPos.Y + (int)(20 * Math.Sin(_currentRobotAngleY)));
+                        robotPos.X + (int)(20 * Math.Cos(robotAngleYCopy)),
+                        robotPos.Y + (int)(20 * Math.Sin(robotAngleYCopy)));
                     CvInvoke.ArrowedLine(map, robotPos, arrowEnd, new MCvScalar(0, 0, 255), 2);
                 }
 
                 return map.ToImage<Bgr, byte>().ToJpegData();
             }
-        }
-
-        private static float GetNextX()
-        {
-            float moveDistance = 0.5f;
-            float nextX = _currentRobotPosition.X + moveDistance * (float)Math.Cos(_currentRobotAngleY);
-
-            if (_slamPoints.Any(p =>
-                Math.Abs(p.X - nextX) < 10 &&
-                Math.Abs(p.Y - _currentRobotPosition.Y) < 10))
-            {
-                return nextX;
-            }
-            return _currentRobotPosition.X;
-        }
-
-        private static float GetNextY()
-        {
-            float moveDistance = 0.5f;
-            float nextY = _currentRobotPosition.Y + moveDistance * (float)Math.Sin(_currentRobotAngleY);
-
-            if (_slamPoints.Any(p =>
-                Math.Abs(p.X - _currentRobotPosition.X) < 10 &&
-                Math.Abs(p.Y - nextY) < 10))
-            {
-                return nextY;
-            }
-            return _currentRobotPosition.Y;
         }
     }
 }
