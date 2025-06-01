@@ -4,6 +4,7 @@ using System.Threading.Tasks;
 using Emgu.CV;
 using Emgu.CV.Util;
 using Emgu.CV.Structure;
+using Serv;
 
 namespace RobotSlamServer
 {
@@ -91,9 +92,7 @@ namespace RobotSlamServer
                 {
                     RobotX = robotX,
                     RobotY = robotY,
-                    RobotAngleX = robotAngleX,
-                    RobotAngleY = robotAngleY,
-                    RobotAngleZ = robotAngleZ,
+                    RobotAngleZ = robotAngleY,
                     LeftCameraInfo = leftCameraInfo,
                     LeftImageData = leftImageBytes,
                     RightCameraInfo = rightCameraInfo,
@@ -112,5 +111,49 @@ namespace RobotSlamServer
                 return StatusCode(500, $"Внутренняя ошибка сервера при обработке стереокадров: {ex.Message}");
             }
         }
+
+        [HttpPost("qr")]
+        public async Task<IActionResult> ProcessQR(
+            [FromForm] IFormFile leftImageData,
+            [FromForm] IFormFile rightImageData)
+        {
+            if (leftImageData == null || leftImageData.Length == 0 ||
+                rightImageData == null || rightImageData.Length == 0)
+            {
+                return BadRequest("Оба изображения (левое и правое) обязательны для обработки");
+            }
+
+            try
+            {
+                byte[] leftImageBytes, rightImageBytes;
+
+                using (var leftStream = new MemoryStream())
+                {
+                    await leftImageData.CopyToAsync(leftStream);
+                    leftImageBytes = leftStream.ToArray();
+                }
+                using (var rightStream = new MemoryStream())
+                {
+                    await rightImageData.CopyToAsync(rightStream);
+                    rightImageBytes = rightStream.ToArray();
+                }
+
+                Serv.StereoFrameRequest stereoRequest = new Serv.StereoFrameRequest
+                {
+                    LeftImageData = leftImageBytes,
+                    RightImageData = rightImageBytes
+                };
+
+                var result = new QRService().ProcessStereoFrame(stereoRequest);
+
+                return Ok(result);
+            }
+            catch (System.Exception ex)
+            {
+                _logger.LogError(ex, "Ошибка обработки стерео кадров: {Message}", ex.Message);
+                return StatusCode(500, $"Внутренняя ошибка сервера при обработке стереокадров: {ex.Message}");
+            }
+        }
+
     }
 }
